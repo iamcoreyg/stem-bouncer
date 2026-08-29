@@ -7,7 +7,7 @@ enum LogicAutomationError: LocalizedError {
     case logicNotRunning
     case logicNotFrontmost
     case noMainWindow
-    case noTracksFound
+    case noTracksFound(URL?)
     case trackUnavailable(String)
     case couldNotSelect(String)
     case bounceDialogTimedOut
@@ -21,7 +21,12 @@ enum LogicAutomationError: LocalizedError {
         case .logicNotRunning: "Logic Pro is not running."
         case .logicNotFrontmost: "Logic Pro must be frontmost."
         case .noMainWindow: "Logic’s main window could not be read."
-        case .noTracksFound: "No track headers were found in Logic’s main window."
+        case .noTracksFound(let diagnostic):
+            if let diagnostic {
+                "No track headers were found. An Accessibility diagnostic was saved to \(diagnostic.path)."
+            } else {
+                "No track headers were found in Logic’s main window."
+            }
         case .trackUnavailable(let name): "The track “\(name)” is no longer available."
         case .couldNotSelect(let name): "Could not select the track “\(name)”."
         case .bounceDialogTimedOut: "Logic’s bounce dialog did not appear within five seconds."
@@ -83,33 +88,47 @@ final class LogicAccessibility {
             throw LogicAutomationError.noMainWindow
         }
 
-        let elements = descendants(of: window, maxDepth: 12, limit: 12_000)
-        let candidates = elements.filter { element in
-            let role = stringValue(element, kAXRoleAttribute)
-            guard role == (kAXRowRole as String) || role == (kAXGroupRole as String) else { return false }
-            let nearbySoloControls = descendants(of: element, maxDepth: 3, limit: 100).filter { isSoloControl($0) }
-            return nearbySoloControls.count == 1
-        }
+        let elements = descendants(of: window, maxDepth: 16, limit: 30_000)
+        let soloControls = elements.filter(isSoloControl)
 
         var occurrenceCounts: [String: Int] = [:]
-        var seenSoloControls = Set<CFHashCode>()
+        var seenHeaders = Set<CFHashCode>()
         var tracks: [LogicTrack] = []
         cachedTrackElements.removeAll()
 
-        for candidate in candidates {
-            guard let soloControl = descendants(of: candidate, maxDepth: 3, limit: 100).first(where: { isSoloControl($0) }),
-                  seenSoloControls.insert(CFHash(soloControl)).inserted,
+        for soloControl in soloControls {
+            guard let candidate = trackHeaderAncestor(for: soloControl),
+                  seenHeaders.insert(CFHash(candidate)).inserted,
                   let name = trackName(from: candidate),
                   !name.isEmpty else { continue }
-            let ordinal = occurrenceCounts[name.matchKey, default: 0]
-            occurrenceCounts[name.matchKey] = ordinal + 1
-            let stackName = parentStackName(of: candidate, excluding: name)
-            let track = LogicTrack(name: name, stackName: stackName, ordinal: ordinal)
-            cachedTrackElements[track.discoveryKey] = candidate
-            tracks.append(track)
+            appendTrack(
+                named: name,
+                header: candidate,
+                occurrenceCounts: &occurrenceCounts,
+                tracks: &tracks
+            )
         }
 
-        guard !tracks.isEmpty else { throw LogicAutomationError.noTracksFound }
+        if tracks.isEmpty {
+            let fallbackHeaders = elements.filter { element in
+                let label = allSearchableText(element)
+                return label.contains("track header") || label.contains("trackheader")
+            }
+            for header in fallbackHeaders {
+                guard seenHeaders.insert(CFHash(header)).inserted,
+                      let name = trackName(from: header) else { continue }
+                appendTrack(
+                    named: name,
+                    header: header,
+                    occurrenceCounts: &occurrenceCounts,
+                    tracks: &tracks
+                )
+            }
+        }
+
+        guard !tracks.isEmpty else {
+            throw LogicAutomationError.noTracksFound(writeAccessibilityDiagnostic(for: window))
+        }
         return tracks
     }
 
@@ -353,14 +372,41 @@ final class LogicAccessibility {
 
     private func trackName(from element: AXUIElement) -> String? {
         for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
-            if let value = stringValue(element, attribute), isPlausibleTrackName(value) { return value }
+            if let value = stringValue(element, attribute), let name = normalizedTrackName(from: value) { return name }
         }
-        let children = descendants(of: element, maxDepth: 3, limit: 80)
-        for child in children where stringValue(child, kAXRoleAttribute) == (kAXStaticTextRole as String) {
-            if let value = stringValue(child, kAXValueAttribute) ?? stringValue(child, kAXTitleAttribute),
-               isPlausibleTrackName(value) { return value }
+        let children = descendants(of: element, maxDepth: 4, limit: 160)
+        let nameRoles = [kAXTextFieldRole as String, kAXStaticTextRole as String]
+        for child in children where nameRoles.contains(stringValue(child, kAXRoleAttribute) ?? "") {
+            for attribute in [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute] {
+                if let value = stringValue(child, attribute), let name = normalizedTrackName(from: value) { return name }
+            }
         }
         return nil
+    }
+
+    private func trackHeaderAncestor(for soloControl: AXUIElement) -> AXUIElement? {
+        var current = soloControl
+        for _ in 0..<9 {
+            guard let parent = copyElement(current, kAXParentAttribute) else { return nil }
+            current = parent
+            let nearbySoloControls = descendants(of: parent, maxDepth: 4, limit: 300).filter(isSoloControl)
+            if nearbySoloControls.count == 1, trackName(from: parent) != nil { return parent }
+        }
+        return nil
+    }
+
+    private func appendTrack(
+        named name: String,
+        header: AXUIElement,
+        occurrenceCounts: inout [String: Int],
+        tracks: inout [LogicTrack]
+    ) {
+        let ordinal = occurrenceCounts[name.matchKey, default: 0]
+        occurrenceCounts[name.matchKey] = ordinal + 1
+        let stackName = parentStackName(of: header, excluding: name)
+        let track = LogicTrack(name: name, stackName: stackName, ordinal: ordinal)
+        cachedTrackElements[track.discoveryKey] = header
+        tracks.append(track)
     }
 
     private func parentStackName(of element: AXUIElement, excluding trackName: String) -> String? {
@@ -369,21 +415,41 @@ final class LogicAccessibility {
             guard let parent = copyElement(current, kAXParentAttribute) else { return nil }
             current = parent
             if let title = stringValue(parent, kAXTitleAttribute),
-               isPlausibleTrackName(title), title != trackName { return title }
+               let name = normalizedTrackName(from: title), name != trackName { return name }
         }
         return nil
     }
 
     private func isSoloControl(_ element: AXUIElement) -> Bool {
-        guard stringValue(element, kAXRoleAttribute) == (kAXButtonRole as String) else { return false }
-        let label = searchableText(element)
-        return label == "solo" || label.hasPrefix("solo ") || label.hasSuffix(" solo")
+        let role = stringValue(element, kAXRoleAttribute)
+        guard role == (kAXButtonRole as String) || role == (kAXCheckBoxRole as String) else { return false }
+        let label = allSearchableText(element)
+        return label == "solo"
+            || label.hasPrefix("solo ")
+            || label.hasSuffix(" solo")
+            || label.contains(" solo button")
+            || label.contains("solo_button")
     }
 
-    private func isPlausibleTrackName(_ value: String) -> Bool {
+    private func normalizedTrackName(from rawValue: String) -> String? {
+        var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercased = value.matchKey
+        if lowercased.hasPrefix("track header:") || lowercased.hasPrefix("track header,") {
+            value = String(value.dropFirst("track header".count + 1))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
         let key = value.matchKey
-        guard !key.isEmpty, key.count <= 160 else { return false }
-        return !["solo", "mute", "record enable", "input monitoring", "volume", "pan"].contains(key)
+        guard !key.isEmpty, key.count <= 160, key.rangeOfCharacter(from: .letters) != nil else { return nil }
+        let excluded = [
+            "solo", "mute", "record enable", "input monitoring", "volume", "pan",
+            "track header", "tracks", "track list", "automation", "read", "off",
+            "hide", "freeze", "protect", "channel strip", "arrangement"
+        ]
+        guard !excluded.contains(key),
+              !key.hasSuffix(" button"),
+              !key.hasSuffix(" checkbox") else { return nil }
+        return value
     }
 
     private func state(forControlContaining terms: [String], in elements: [AXUIElement]) -> Bool? {
@@ -409,6 +475,59 @@ final class LogicAccessibility {
             .compactMap { stringValue(element, $0) }
             .joined(separator: " ")
             .matchKey
+    }
+
+    private func allSearchableText(_ element: AXUIElement) -> String {
+        [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute, kAXIdentifierAttribute, kAXRoleDescriptionAttribute]
+            .compactMap { stringValue(element, $0) }
+            .joined(separator: " ")
+            .matchKey
+    }
+
+    private func writeAccessibilityDiagnostic(for root: AXUIElement) -> URL? {
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appending(path: "StemBouncer/Diagnostics", directoryHint: .isDirectory)
+        let url = directory.appending(path: "latest-logic-ax.txt")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var lines = [
+                "StemBouncer Logic Accessibility Diagnostic",
+                "Logic version: \(logicVersion)",
+                "Session: \(currentSessionName ?? "Unknown")",
+                "Generated: \(Date.now.formatted(.iso8601))",
+                ""
+            ]
+            appendDiagnosticLines(for: root, depth: 0, remaining: 30_000, lines: &lines)
+            try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    private func appendDiagnosticLines(
+        for element: AXUIElement,
+        depth: Int,
+        remaining: Int,
+        lines: inout [String]
+    ) {
+        guard remaining > 0 else { return }
+        let attributes = [
+            "role=\(stringValue(element, kAXRoleAttribute) ?? "")",
+            "subrole=\(stringValue(element, kAXSubroleAttribute) ?? "")",
+            "identifier=\(stringValue(element, kAXIdentifierAttribute) ?? "")",
+            "title=\(stringValue(element, kAXTitleAttribute) ?? "")",
+            "description=\(stringValue(element, kAXDescriptionAttribute) ?? "")",
+            "help=\(stringValue(element, kAXHelpAttribute) ?? "")",
+            "value=\(stringValue(element, kAXValueAttribute) ?? "")"
+        ]
+        lines.append("\(String(repeating: "  ", count: depth))\(attributes.joined(separator: " | "))")
+        var remainingChildren = remaining - 1
+        for child in copyArray(element, kAXChildrenAttribute) where remainingChildren > 0 {
+            let before = lines.count
+            appendDiagnosticLines(for: child, depth: depth + 1, remaining: remainingChildren, lines: &lines)
+            remainingChildren -= lines.count - before
+        }
     }
 
     private func descendants(of root: AXUIElement, maxDepth: Int, limit: Int) -> [AXUIElement] {
