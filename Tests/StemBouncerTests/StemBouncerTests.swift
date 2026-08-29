@@ -1,3 +1,4 @@
+import ApplicationServices
 import Foundation
 import Testing
 @testable import StemBouncer
@@ -11,6 +12,17 @@ import Testing
 @Test func presetMatchingKeyNormalizesCaseAndWhitespace() {
     #expect("  Lead   VOX \n".matchKey == "lead vox")
     #expect("Kick".matchKey == "kick")
+}
+
+@Test func logicTrackHeaderDescriptionYieldsTheDisplayedName() {
+    #expect(LogicAccessibility.trackName(inHeaderDescription: "Track 20 “jan 5 kick”") == "jan 5 kick")
+    #expect(LogicAccessibility.trackName(inHeaderDescription: "Track 2 \"Audio 12\"") == "Audio 12")
+}
+
+@Test func logicTrackHeaderRolesIncludeLogicTwelveLayoutItems() {
+    #expect(LogicAccessibility.isTrackHeaderRole(kAXLayoutItemRole as String))
+    #expect(LogicAccessibility.isTrackHeaderRole(kAXGroupRole as String))
+    #expect(!LogicAccessibility.isTrackHeaderRole(kAXRadioButtonRole as String))
 }
 
 @Test func fileWatcherRequiresAStableNonemptyFile() async throws {
