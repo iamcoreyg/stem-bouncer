@@ -25,6 +25,12 @@ import Testing
     #expect(!LogicAccessibility.isTrackHeaderRole(kAXRadioButtonRole as String))
 }
 
+@Test func logicSavePanelUsesTheNamedFilenameField() {
+    #expect(LogicAccessibility.isSaveFilenameField(identifier: "saveAsNameTextField", label: ""))
+    #expect(LogicAccessibility.isSaveFilenameField(identifier: nil, label: "Save As:"))
+    #expect(!LogicAccessibility.isSaveFilenameField(identifier: nil, label: "manifest.json"))
+}
+
 @Test func fileWatcherRequiresAStableNonemptyFile() async throws {
     let folder = FileManager.default.temporaryDirectory
         .appendingPathComponent("StemBouncerTests-\(UUID().uuidString)", isDirectory: true)

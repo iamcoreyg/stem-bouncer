@@ -76,9 +76,36 @@ final class LogicAccessibility {
     func activateLogic() async throws {
         guard isTrusted else { throw LogicAutomationError.accessibilityDenied }
         guard let application = runningApplication else { throw LogicAutomationError.logicNotRunning }
-        application.activate(options: [.activateAllWindows])
-        try await Task.sleep(for: .milliseconds(100))
-        guard isLogicFrontmost else { throw LogicAutomationError.logicNotFrontmost }
+        let currentApplication = NSRunningApplication.current
+        NSApplication.shared.yieldActivation(to: application)
+        application.activate(from: currentApplication, options: [.activateAllWindows])
+        let systemWideElement = AXUIElementCreateSystemWide()
+        let logicElement = AXUIElementCreateApplication(application.processIdentifier)
+        _ = AXUIElementSetAttributeValue(
+            systemWideElement,
+            kAXFocusedApplicationAttribute as CFString,
+            logicElement
+        )
+        if let bundleURL = application.bundleURL {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            do {
+                _ = try await NSWorkspace.shared.openApplication(at: bundleURL, configuration: configuration)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // The other activation requests can still complete the handoff.
+            }
+        }
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while clock.now < deadline {
+            try Task.checkCancellation()
+            if isLogicFrontmost { return }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw LogicAutomationError.logicNotFrontmost
     }
 
     func discoverTracks() throws -> [LogicTrack] {
@@ -331,11 +358,17 @@ final class LogicAccessibility {
     private func filenameField(in window: AXUIElement) -> AXUIElement? {
         descendants(of: window, maxDepth: 8, limit: 2_000).first { element in
             guard stringValue(element, kAXRoleAttribute) == (kAXTextFieldRole as String) else { return false }
-            let label = searchableText(element)
-            return label.contains("save as") || label.contains("filename") || label.contains("name")
-        } ?? descendants(of: window, maxDepth: 8, limit: 2_000).first {
-            stringValue($0, kAXRoleAttribute) == (kAXTextFieldRole as String)
+            return Self.isSaveFilenameField(
+                identifier: stringValue(element, kAXIdentifierAttribute),
+                label: searchableText(element)
+            )
         }
+    }
+
+    nonisolated static func isSaveFilenameField(identifier: String?, label: String) -> Bool {
+        identifier?.matchKey == "saveasnametextfield"
+            || label.matchKey.contains("save as")
+            || label.matchKey.contains("filename")
     }
 
     private func setFilename(_ filename: String, in field: AXUIElement) throws {
