@@ -31,6 +31,20 @@ import Testing
     #expect(!LogicAccessibility.isSaveFilenameField(identifier: nil, label: "manifest.json"))
 }
 
+@Test func logicBounceLabelsMatchNamesWithoutPunctuation() {
+    #expect(LogicAccessibility.axLabel("Uncompressed", matches: "uncompressed"))
+    #expect(LogicAccessibility.axLabel("File Type:", matches: "file type"))
+    #expect(!LogicAccessibility.axLabel("Sample Rate:", matches: "file type"))
+}
+
+@Test func logicRecognizesNamedUncompressedFileTypes() {
+    #expect(LogicAccessibility.isUncompressedFileTypeValue("AIFF"))
+    #expect(LogicAccessibility.isUncompressedFileTypeValue("WAVE"))
+    #expect(LogicAccessibility.isUncompressedFileTypeValue("CAF"))
+    #expect(!LogicAccessibility.isUncompressedFileTypeValue("Interleaved"))
+    #expect(!LogicAccessibility.isUncompressedFileTypeValue("44.1 kHz"))
+}
+
 @Test func fileWatcherRequiresAStableNonemptyFile() async throws {
     let folder = FileManager.default.temporaryDirectory
         .appendingPathComponent("StemBouncerTests-\(UUID().uuidString)", isDirectory: true)
@@ -46,6 +60,49 @@ import Testing
     let watcher = FileCompletionWatcher(pollInterval: .milliseconds(20), stableInterval: .milliseconds(50))
     let result = try await watcher.waitForFile(prefix: "01_Kick", in: folder, timeout: .seconds(2))
     #expect(result.standardizedFileURL == expected.standardizedFileURL)
+}
+
+@Test func fileWatcherCanRequireWAVOutput() async throws {
+    let folder = FileManager.default.temporaryDirectory
+        .appendingPathComponent("StemBouncerTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    try Data([0, 1, 2, 3]).write(to: folder.appendingPathComponent("01_Kick.mp3"))
+    let expected = folder.appendingPathComponent("01_Kick.wav")
+    let writer = Task {
+        try await Task.sleep(for: .milliseconds(100))
+        try Data([4, 5, 6, 7]).write(to: expected)
+    }
+    defer { writer.cancel() }
+
+    let watcher = FileCompletionWatcher(pollInterval: .milliseconds(20), stableInterval: .milliseconds(50))
+    let result = try await watcher.waitForFile(
+        prefix: "01_Kick",
+        fileExtension: "wav",
+        in: folder,
+        timeout: .seconds(2)
+    )
+    #expect(result.standardizedFileURL == expected.standardizedFileURL)
+}
+
+@Test func fileWatcherFindsExistingWAVWithoutMatchingOtherFormats() throws {
+    let folder = FileManager.default.temporaryDirectory
+        .appendingPathComponent("StemBouncerTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let mp3 = folder.appendingPathComponent("01_Kick.mp3")
+    let wav = folder.appendingPathComponent("01_Kick.wav")
+    try Data([0]).write(to: mp3)
+    try Data([1]).write(to: wav)
+
+    let watcher = FileCompletionWatcher()
+    #expect(
+        watcher.existingFile(prefix: "01_Kick", fileExtension: "wav", in: folder)?.standardizedFileURL
+            == wav.standardizedFileURL
+    )
+    #expect(watcher.existingFile(prefix: "02_Snare", fileExtension: "wav", in: folder) == nil)
 }
 
 @Test func groupsSupportOverlapAndContributeOnlyMembers() {

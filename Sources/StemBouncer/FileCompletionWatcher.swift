@@ -21,6 +21,7 @@ struct FileCompletionWatcher {
 
     func waitForFile(
         prefix: String,
+        fileExtension: String? = nil,
         in folder: URL,
         timeout: Duration,
         onPoll: (@MainActor @Sendable () async throws -> Void)? = nil
@@ -34,16 +35,7 @@ struct FileCompletionWatcher {
         while clock.now < deadline {
             try Task.checkCancellation()
             try await onPoll?()
-            let files = (try? FileManager.default.contentsOfDirectory(
-                at: folder,
-                includingPropertiesForKeys: [.fileSizeKey],
-                options: [.skipsHiddenFiles]
-            )) ?? []
-
-            let match = files
-                .filter { $0.deletingPathExtension().lastPathComponent == prefix }
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
-                .first
+            let match = existingFile(prefix: prefix, fileExtension: fileExtension, in: folder)
 
             if match != candidate {
                 candidate = match
@@ -70,5 +62,21 @@ struct FileCompletionWatcher {
         }
 
         throw FileCompletionError.timedOut(prefix)
+    }
+
+    func existingFile(prefix: String, fileExtension: String? = nil, in folder: URL) -> URL? {
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: folder,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return files
+            .filter { file in
+                guard file.deletingPathExtension().lastPathComponent == prefix else { return false }
+                guard let fileExtension else { return true }
+                return file.pathExtension.caseInsensitiveCompare(fileExtension) == .orderedSame
+            }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .first
     }
 }

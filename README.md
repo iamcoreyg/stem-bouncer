@@ -13,6 +13,7 @@ This repository is published for reference and personal use. No open-source lice
 - Preflight for Accessibility, Logic, output-folder access, exposed solo-safe/solo-lock state, metronome, and cycle state
 - Focus guard that pauses before sending keys to another app
 - Sequential solo → offline bounce → file-stability wait → unsolo loop
+- Named-control configuration of uncompressed WAV output before each real bounce
 - Versioned `Session - Take NN` output directories
 - State persisted after every transition, including interruption recovery
 - Incremental `manifest.json` with group makeup, observed dialog labels, Logic version, timestamps, output names, and summing caveat
@@ -36,7 +37,7 @@ The built app is unsandboxed because Accessibility automation and synthesized ke
 
 ## First run
 
-1. Open the Logic session and make one manual bounce to establish the desired file format, sample rate, normalization, range/tail behavior, and destination.
+1. Open the Logic session and make one manual bounce to establish the desired sample rate, normalization, and range/tail behavior. StemBouncer sets the destination to uncompressed WAV for real exports.
 2. Open StemBouncer, grant Accessibility access, and choose **Read Open Logic Session**.
 3. Choose a saved Stem Set or start from Track Stacks. Open any stem to adjust membership; **Processing contributor** keeps a sidechain/support track active and audible by design.
 4. Choose the parent output folder. Each run creates a fresh take directory and navigates Logic's save panel there.

@@ -68,6 +68,38 @@ final class BounceEngine {
             if state.completedGroupIDs.contains(group.id) { continue }
             guard !group.members.isEmpty else { continue }
 
+            let filename = group.filename(at: index)
+            if !configuration.dryRun,
+               watcher.existingFile(prefix: filename, fileExtension: "wav", in: state.outputFolder) != nil {
+                onUpdate(.init(
+                    statusText: "Verifying existing \(filename).wav",
+                    groupIndex: index,
+                    progress: Double(index) / Double(max(state.groups.count, 1)),
+                    completedGroupIDs: state.completedGroupIDs
+                ))
+                _ = try await watcher.waitForFile(
+                    prefix: filename,
+                    fileExtension: "wav",
+                    in: state.outputFolder,
+                    timeout: .seconds(10),
+                    onPoll: { try self.logic.assertNoBlockingDialog() }
+                )
+                state.completedGroupIDs.insert(group.id)
+                state.updatedAt = Date()
+                manifest.groups[index].completedAt = state.updatedAt
+                manifest.groups[index].status = "complete"
+                manifest.bounceSettingsObserved = logic.observedBounceSettings()
+                try await store.save(run: state)
+                try await store.write(manifest: manifest, to: state.outputFolder)
+                onUpdate(.init(
+                    statusText: "Recovered \(group.name) from its completed WAV",
+                    groupIndex: index,
+                    progress: Double(state.completedGroupIDs.count) / Double(max(state.groups.count, 1)),
+                    completedGroupIDs: state.completedGroupIDs
+                ))
+                continue
+            }
+
             onUpdate(.init(
                 statusText: "Soloing \(group.name)",
                 groupIndex: index,
@@ -96,7 +128,6 @@ final class BounceEngine {
                 if configuration.dryRun {
                     try await Task.sleep(for: .milliseconds(400))
                 } else {
-                    let filename = group.filename(at: index)
                     onUpdate(.init(
                         statusText: "Bouncing \(filename)",
                         groupIndex: index,
@@ -107,6 +138,7 @@ final class BounceEngine {
                     let timeoutSeconds = max(120, (state.firstBounceDuration ?? 300) * 3)
                     _ = try await watcher.waitForFile(
                         prefix: filename,
+                        fileExtension: "wav",
                         in: state.outputFolder,
                         timeout: .seconds(timeoutSeconds),
                         onPoll: { try self.logic.assertNoBlockingDialog() }
@@ -133,6 +165,7 @@ final class BounceEngine {
                     completedGroupIDs: state.completedGroupIDs
                 ))
             } catch {
+                await logic.cancelOpenBounceDialogs()
                 if logic.isLogicFrontmost, (try? await setSolo(false, for: memberTracks)) != nil {
                     state.activeGroupID = nil
                     state.updatedAt = Date()
@@ -154,9 +187,10 @@ final class BounceEngine {
         guard logic.isLogicFrontmost else { throw LogicAutomationError.logicNotFrontmost }
         for track in tracks {
             try Task.checkCancellation()
+            if try logic.isTrackSoloed(track) == enabled { continue }
             try logic.selectTrack(track)
             keys.sendSolo()
-            try await Task.sleep(for: .milliseconds(75))
+            try await logic.waitForSoloState(enabled, for: track)
         }
     }
 

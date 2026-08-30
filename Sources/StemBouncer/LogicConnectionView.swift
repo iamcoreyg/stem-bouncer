@@ -33,7 +33,7 @@ struct LogicConnectionView: View {
                     .buttonStyle(.link)
             }
 
-            Label("Logic stays in control of the sound. Your current bounce settings, buses, sends, effects, and master chain are preserved.", systemImage: "checkmark.shield")
+            Label("Logic stays in control of the sound. StemBouncer selects uncompressed WAV while preserving your sample rate, buses, sends, effects, and master chain.", systemImage: "checkmark.shield")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
