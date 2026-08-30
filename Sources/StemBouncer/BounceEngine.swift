@@ -52,12 +52,32 @@ final class BounceEngine {
         keys.bounceKeyCode = CGKeyCode(configuration.bounceKeyCode)
 
         if let activeGroupID = state.activeGroupID,
-           let interruptedGroup = state.groups.first(where: { $0.id == activeGroupID }) {
+           let interruptedGroupIndex = state.groups.firstIndex(where: { $0.id == activeGroupID }) {
+            let interruptedGroup = state.groups[interruptedGroupIndex]
             let tracks = interruptedGroup.members.compactMap { member in
                 state.tracks.first { $0.id == member.trackID }
             }
             try await logic.activateLogic()
             try await setSolo(false, for: tracks)
+            if !configuration.dryRun {
+                let filename = interruptedGroup.filename(at: interruptedGroupIndex)
+                if let interruptedFile = watcher.existingFile(
+                    prefix: filename,
+                    fileExtension: "wav",
+                    in: state.outputFolder
+                ) {
+                    let preservedFile = try watcher.preserveInterruptedFile(interruptedFile)
+                    manifest.groups[interruptedGroupIndex].status =
+                        "interrupted file preserved as \(preservedFile.lastPathComponent)"
+                    try await store.write(manifest: manifest, to: state.outputFolder)
+                    onUpdate(.init(
+                        statusText: "Preserved interrupted \(preservedFile.lastPathComponent)",
+                        groupIndex: interruptedGroupIndex,
+                        progress: Double(state.completedGroupIDs.count) / Double(max(state.groups.count, 1)),
+                        completedGroupIDs: state.completedGroupIDs
+                    ))
+                }
+            }
             state.activeGroupID = nil
             state.updatedAt = Date()
             try await store.save(run: state)
@@ -148,6 +168,7 @@ final class BounceEngine {
                     }
                 }
 
+                try logic.assertNoBlockingDialog()
                 try await setSolo(false, for: memberTracks)
                 state.activeGroupID = nil
                 state.completedGroupIDs.insert(group.id)
@@ -185,11 +206,12 @@ final class BounceEngine {
 
     private func setSolo(_ enabled: Bool, for tracks: [LogicTrack]) async throws {
         guard logic.isLogicFrontmost else { throw LogicAutomationError.logicNotFrontmost }
+        try logic.assertNoBlockingDialog()
         for track in tracks {
             try Task.checkCancellation()
             if try logic.isTrackSoloed(track) == enabled { continue }
-            try logic.selectTrack(track)
-            keys.sendSolo()
+            try await logic.selectTrack(track)
+            try keys.sendSolo()
             try await logic.waitForSoloState(enabled, for: track)
         }
     }

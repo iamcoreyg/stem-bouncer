@@ -25,6 +25,27 @@ import Testing
     #expect(!LogicAccessibility.isTrackHeaderRole(kAXRadioButtonRole as String))
 }
 
+@Test func logicRecognizesTheNamedTrackFocusIndicator() {
+    #expect(
+        LogicAccessibility.isTrackFocusIndicator(
+            role: kAXRadioButtonRole as String,
+            description: "Has Focus"
+        )
+    )
+    #expect(
+        LogicAccessibility.isTrackFocusIndicator(
+            role: kAXCheckBoxRole as String,
+            description: "Has Focus"
+        ) == false
+    )
+    #expect(
+        LogicAccessibility.isTrackFocusIndicator(
+            role: kAXRadioButtonRole as String,
+            description: "Solo"
+        ) == false
+    )
+}
+
 @Test func logicSavePanelUsesTheNamedFilenameField() {
     #expect(LogicAccessibility.isSaveFilenameField(identifier: "saveAsNameTextField", label: ""))
     #expect(LogicAccessibility.isSaveFilenameField(identifier: nil, label: "Save As:"))
@@ -43,6 +64,51 @@ import Testing
     #expect(LogicAccessibility.isUncompressedFileTypeValue("CAF"))
     #expect(!LogicAccessibility.isUncompressedFileTypeValue("Interleaved"))
     #expect(!LogicAccessibility.isUncompressedFileTypeValue("44.1 kHz"))
+}
+
+@Test func logicWaitsForNamedDialogContentsInsteadOfATransientWindowShell() {
+    #expect(
+        LogicAccessibility.bounceDialogKind(
+            hasFilenameField: false,
+            hasUncompressedDestination: false
+        ) == nil
+    )
+    #expect(
+        LogicAccessibility.bounceDialogKind(
+            hasFilenameField: false,
+            hasUncompressedDestination: true
+        ) == .bounce
+    )
+    #expect(
+        LogicAccessibility.bounceDialogKind(
+            hasFilenameField: true,
+            hasUncompressedDestination: false
+        ) == .save
+    )
+}
+
+@Test func logicSubmitsOnlyNamedConfirmationButtons() {
+    #expect(LogicAccessibility.isConfirmationButtonLabel("OK"))
+    #expect(LogicAccessibility.isConfirmationButtonLabel("Save"))
+    #expect(LogicAccessibility.isConfirmationButtonLabel("Bounce"))
+    #expect(!LogicAccessibility.isConfirmationButtonLabel("Cancel"))
+    #expect(!LogicAccessibility.isConfirmationButtonLabel("Replace"))
+}
+
+@Test @MainActor func keySenderRefusesToPostOutsideLogic() {
+    let sender = KeySender(
+        targetBundleIdentifier: LogicAccessibility.bundleIdentifier,
+        frontmostBundleIdentifier: { "com.example.NotLogic" }
+    )
+
+    do {
+        try sender.validateTargetIsFrontmost()
+        Issue.record("Expected a non-Logic frontmost app to block synthesized keys.")
+    } catch LogicAutomationError.logicNotFrontmost {
+        // Expected.
+    } catch {
+        Issue.record("Unexpected error: \(error)")
+    }
 }
 
 @Test func fileWatcherRequiresAStableNonemptyFile() async throws {
@@ -103,6 +169,25 @@ import Testing
             == wav.standardizedFileURL
     )
     #expect(watcher.existingFile(prefix: "02_Snare", fileExtension: "wav", in: folder) == nil)
+}
+
+@Test func fileWatcherPreservesAnInterruptedWAVWithoutOverwriting() throws {
+    let folder = FileManager.default.temporaryDirectory
+        .appendingPathComponent("StemBouncerTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let interrupted = folder.appendingPathComponent("15_no luck.wav")
+    let occupied = folder.appendingPathComponent("15_no luck - Interrupted 01.wav")
+    try Data([1, 2, 3]).write(to: interrupted)
+    try Data([9]).write(to: occupied)
+
+    let preserved = try FileCompletionWatcher().preserveInterruptedFile(interrupted)
+
+    #expect(preserved.lastPathComponent == "15_no luck - Interrupted 02.wav")
+    #expect(!FileManager.default.fileExists(atPath: interrupted.path))
+    #expect(try Data(contentsOf: preserved) == Data([1, 2, 3]))
+    #expect(try Data(contentsOf: occupied) == Data([9]))
 }
 
 @Test func groupsSupportOverlapAndContributeOnlyMembers() {

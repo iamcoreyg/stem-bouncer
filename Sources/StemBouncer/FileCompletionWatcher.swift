@@ -65,6 +65,13 @@ struct FileCompletionWatcher {
     }
 
     func existingFile(prefix: String, fileExtension: String? = nil, in folder: URL) -> URL? {
+        if let fileExtension {
+            let expectedFile = folder
+                .appendingPathComponent(prefix)
+                .appendingPathExtension(fileExtension)
+            return FileManager.default.fileExists(atPath: expectedFile.path) ? expectedFile : nil
+        }
+
         let files = (try? FileManager.default.contentsOfDirectory(
             at: folder,
             includingPropertiesForKeys: [.fileSizeKey],
@@ -73,10 +80,29 @@ struct FileCompletionWatcher {
         return files
             .filter { file in
                 guard file.deletingPathExtension().lastPathComponent == prefix else { return false }
-                guard let fileExtension else { return true }
-                return file.pathExtension.caseInsensitiveCompare(fileExtension) == .orderedSame
+                return true
             }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
             .first
+    }
+
+    func preserveInterruptedFile(_ file: URL) throws -> URL {
+        let stem = file.deletingPathExtension().lastPathComponent
+        let fileExtension = file.pathExtension
+        let folder = file.deletingLastPathComponent()
+
+        for attempt in 1...999 {
+            var candidate = folder.appendingPathComponent(
+                "\(stem) - Interrupted \(String(format: "%02d", attempt))"
+            )
+            if !fileExtension.isEmpty {
+                candidate.appendPathExtension(fileExtension)
+            }
+            guard !FileManager.default.fileExists(atPath: candidate.path) else { continue }
+            try FileManager.default.moveItem(at: file, to: candidate)
+            return candidate
+        }
+
+        throw CocoaError(.fileWriteFileExists)
     }
 }

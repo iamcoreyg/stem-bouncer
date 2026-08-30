@@ -6,6 +6,7 @@ enum LogicAutomationError: LocalizedError {
     case accessibilityDenied
     case logicNotRunning
     case logicNotFrontmost
+    case keyEventUnavailable
     case noMainWindow
     case noTracksFound(URL?)
     case trackUnavailable(String)
@@ -24,6 +25,7 @@ enum LogicAutomationError: LocalizedError {
         case .accessibilityDenied: "Accessibility permission is required."
         case .logicNotRunning: "Logic Pro is not running."
         case .logicNotFrontmost: "Logic Pro must be frontmost."
+        case .keyEventUnavailable: "macOS could not create the requested Logic key event."
         case .noMainWindow: "Logic’s main window could not be read."
         case .noTracksFound(let diagnostic):
             if let diagnostic {
@@ -35,16 +37,21 @@ enum LogicAutomationError: LocalizedError {
         case .couldNotSelect(let name): "Could not select the track “\(name)”."
         case .soloStateUnavailable(let name): "Logic did not expose the Solo state for “\(name)”."
         case .couldNotSetSolo(let name, let enabled): "Logic did not turn Solo \(enabled ? "on" : "off") for “\(name)”."
-        case .bounceDialogTimedOut: "Logic’s bounce dialog did not appear within five seconds."
+        case .bounceDialogTimedOut: "Logic’s bounce dialog did not appear within 15 seconds."
         case .bounceFormatControlMissing(let control): "Logic’s bounce dialog did not expose the \(control) control."
         case .couldNotSetBounceFormat(let detail): "Could not configure Logic for WAV output: \(detail)."
         case .filenameFieldMissing: "The bounce save dialog appeared, but its filename field was not found."
         case .confirmationButtonMissing: "The expected Bounce or Save button was not found."
-        case .unexpectedDialog(let title, let screenshot):
-            if let screenshot { "Unexpected Logic dialog “\(title)”. Screenshot: \(screenshot.path)" }
+        case .unexpectedDialog(let title, let diagnostic):
+            if let diagnostic { "Unexpected Logic dialog “\(title)”. Diagnostic: \(diagnostic.path)" }
             else { "Unexpected Logic dialog “\(title)”." }
         }
     }
+}
+
+enum LogicBounceDialogKind: Equatable {
+    case bounce
+    case save
 }
 
 @MainActor
@@ -169,38 +176,29 @@ final class LogicAccessibility {
         return tracks
     }
 
-    func selectTrack(_ track: LogicTrack) throws {
+    func selectTrack(_ track: LogicTrack) async throws {
         guard let element = cachedTrackElements[track.discoveryKey] else {
             throw LogicAutomationError.trackUnavailable(track.name)
         }
 
         if let parent = copyElement(element, kAXParentAttribute) {
-            _ = AXUIElementSetAttributeValue(
-                parent,
-                kAXSelectedChildrenAttribute as CFString,
-                [] as CFArray
-            )
+            if isOnlySelectedTrack(element, in: parent) { return }
+
             if AXUIElementSetAttributeValue(
                 parent,
                 kAXSelectedChildrenAttribute as CFString,
                 [element] as CFArray
             ) == .success,
-               isOnlySelectedTrack(element, in: parent) {
+               try await waitForExclusiveTrackSelection(
+                   element,
+                   in: parent,
+                   timeout: .seconds(1)
+               ) {
                 return
             }
         }
 
-        let focusedResult = AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-        if focusedResult == .success,
-           let parent = copyElement(element, kAXParentAttribute),
-           isOnlySelectedTrack(element, in: parent) { return }
-
-        let selectedResult = AXUIElementSetAttributeValue(element, kAXSelectedAttribute as CFString, kCFBooleanTrue)
-        guard selectedResult == .success,
-              let parent = copyElement(element, kAXParentAttribute),
-              isOnlySelectedTrack(element, in: parent) else {
-            throw LogicAutomationError.couldNotSelect(track.name)
-        }
+        throw LogicAutomationError.couldNotSelect(track.name)
     }
 
     func isTrackSoloed(_ track: LogicTrack) throws -> Bool {
@@ -300,34 +298,32 @@ final class LogicAccessibility {
     }
 
     func openBounceAndSubmit(filename: String, outputFolder: URL, keySender: KeySender) async throws {
-        let baselineWindows = Set(currentWindows().map(CFHash))
-        keySender.send(keyCode: keySender.bounceKeyCode, modifiers: .maskCommand)
-        guard let firstDialog = try await waitForNewWindow(excluding: baselineWindows, timeout: .seconds(5)) else {
+        let baselineDialogs = Set(currentWindowsAndSheets().map(CFHash))
+        try keySender.send(keyCode: keySender.bounceKeyCode, modifiers: .maskCommand)
+        guard let firstDialog = try await waitForBounceOrSaveDialog(
+            excluding: baselineDialogs,
+            timeout: .seconds(15)
+        ) else {
             throw LogicAutomationError.bounceDialogTimedOut
         }
 
-        if filenameField(in: firstDialog) != nil {
+        if firstDialog.kind == .save {
             try await navigateSavePanel(to: outputFolder, keySender: keySender)
             guard let currentDialog = try await waitForWindowWithFilenameField(excluding: [], timeout: .seconds(2)),
                   let currentField = filenameField(in: currentDialog) else { throw LogicAutomationError.filenameFieldMissing }
-            try setFilename(filename, in: currentField)
-            try pressDefaultButton(in: currentDialog)
+            try await setFilename(filename, in: currentField)
+            try submitDefaultButton(in: currentDialog, keySender: keySender)
             return
         }
 
-        let labels = windowLabels(firstDialog)
-        guard labels.contains(where: { $0.matchKey.contains("bounce") }) else {
-            throw LogicAutomationError.unexpectedDialog(windowTitle(firstDialog), captureDiagnosticScreenshot())
-        }
-
         do {
-            try await configureWAVBounce(in: firstDialog)
+            try await configureWAVBounce(in: firstDialog.element)
         } catch {
-            await cancel(dialog: firstDialog)
+            await cancel(dialog: firstDialog.element)
             throw error
         }
-        try pressDefaultButton(in: firstDialog)
-        let secondBaseline = Set(currentWindows().map(CFHash))
+        let secondBaseline = Set(currentWindowsAndSheets().map(CFHash))
+        try submitDefaultButton(in: firstDialog.element, keySender: keySender)
         guard let saveDialog = try await waitForWindowWithFilenameField(excluding: secondBaseline, timeout: .seconds(5)),
               let field = filenameField(in: saveDialog) else {
             throw LogicAutomationError.filenameFieldMissing
@@ -336,8 +332,8 @@ final class LogicAccessibility {
         try await navigateSavePanel(to: outputFolder, keySender: keySender)
         guard let currentDialog = try await waitForWindowWithFilenameField(excluding: [], timeout: .seconds(2)),
               let currentField = filenameField(in: currentDialog) else { throw LogicAutomationError.filenameFieldMissing }
-        try setFilename(filename, in: currentField)
-        try pressDefaultButton(in: currentDialog)
+        try await setFilename(filename, in: currentField)
+        try submitDefaultButton(in: currentDialog, keySender: keySender)
     }
 
     private func configureWAVBounce(in dialog: AXUIElement) async throws {
@@ -558,8 +554,19 @@ final class LogicAccessibility {
         }
     }
 
+    private func captureUnexpectedDialog(_ dialog: AXUIElement) -> URL? {
+        _ = captureDiagnosticScreenshot()
+        return writeAccessibilityDiagnostic(
+            for: [dialog],
+            filename: "latest-logic-dialog-ax.txt"
+        )
+    }
+
     func assertNoBlockingDialog() throws {
-        let blockingTerms = ["overwrite", "replace", "not found", "missing file", "error"]
+        let blockingTerms = [
+            "overwrite", "replace", "not found", "missing file", "error",
+            "reported a problem", "system to become unstable", "quit and restart logic"
+        ]
         let dialogs = currentWindows().flatMap { window in
             descendants(of: window, maxDepth: 5, limit: 1_000).filter {
                 let role = stringValue($0, kAXRoleAttribute)
@@ -570,7 +577,7 @@ final class LogicAccessibility {
             let text = windowLabels(dialog).joined(separator: " ").matchKey
             return blockingTerms.contains(where: text.contains)
         }) {
-            throw LogicAutomationError.unexpectedDialog(windowTitle(dialog), captureDiagnosticScreenshot())
+            throw LogicAutomationError.unexpectedDialog(windowTitle(dialog), captureUnexpectedDialog(dialog))
         }
     }
 
@@ -581,7 +588,9 @@ final class LogicAccessibility {
             await waitUntilElementDisappears(goToWindow, timeout: .seconds(2))
         }
 
-        for dialog in currentWindowsAndSheets() where filenameField(in: dialog) != nil || windowTitle(dialog).matchKey.contains("bounce") {
+        for dialog in currentWindowsAndSheets() where filenameField(in: dialog) != nil
+            || bounceDestinationTable(in: dialog) != nil
+            || windowTitle(dialog).matchKey.contains("bounce") {
             await cancel(dialog: dialog)
         }
     }
@@ -599,6 +608,15 @@ final class LogicAccessibility {
     private func currentWindowsAndSheets() -> [AXUIElement] {
         let windows = currentWindows()
         return windows + windows.flatMap { copyArray($0, "AXSheets") }
+    }
+
+    nonisolated static func bounceDialogKind(
+        hasFilenameField: Bool,
+        hasUncompressedDestination: Bool
+    ) -> LogicBounceDialogKind? {
+        if hasFilenameField { return .save }
+        if hasUncompressedDestination { return .bounce }
+        return nil
     }
 
     private func element(withIdentifier identifier: String, in roots: [AXUIElement]) -> AXUIElement? {
@@ -637,14 +655,34 @@ final class LogicAccessibility {
         }
     }
 
-    private func waitForNewWindow(excluding baseline: Set<CFHashCode>, timeout: Duration) async throws -> AXUIElement? {
+    private func waitForBounceOrSaveDialog(
+        excluding baseline: Set<CFHashCode>,
+        timeout: Duration
+    ) async throws -> (element: AXUIElement, kind: LogicBounceDialogKind)? {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
+        var latestUnexpectedDialog: AXUIElement?
+
         while clock.now < deadline {
             try Task.checkCancellation()
-            if let window = currentWindows().first(where: { !baseline.contains(CFHash($0)) }) { return window }
-            if let sheet = currentWindows().flatMap({ copyArray($0, "AXSheets") }).first { return sheet }
+            let candidates = currentWindowsAndSheets().filter { !baseline.contains(CFHash($0)) }
+            for candidate in candidates {
+                if let kind = Self.bounceDialogKind(
+                    hasFilenameField: filenameField(in: candidate) != nil,
+                    hasUncompressedDestination: bounceDestinationTable(in: candidate) != nil
+                ) {
+                    return (candidate, kind)
+                }
+            }
+            latestUnexpectedDialog = candidates.first
             try await Task.sleep(for: .milliseconds(100))
+        }
+
+        if let latestUnexpectedDialog {
+            throw LogicAutomationError.unexpectedDialog(
+                windowTitle(latestUnexpectedDialog),
+                captureUnexpectedDialog(latestUnexpectedDialog)
+            )
         }
         return nil
     }
@@ -678,14 +716,22 @@ final class LogicAccessibility {
             || label.matchKey.contains("filename")
     }
 
-    private func setFilename(_ filename: String, in field: AXUIElement) throws {
+    private func setFilename(_ filename: String, in field: AXUIElement) async throws {
         guard AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, filename as CFString) == .success else {
             throw LogicAutomationError.filenameFieldMissing
         }
+        guard try await waitForStringValue(of: field, toEqual: filename, timeout: .seconds(2)) else {
+            throw LogicAutomationError.filenameFieldMissing
+        }
+        _ = AXUIElementSetAttributeValue(
+            field,
+            kAXFocusedAttribute as CFString,
+            kCFBooleanTrue
+        )
     }
 
     private func navigateSavePanel(to folder: URL, keySender: KeySender) async throws {
-        keySender.send(keyCode: 5, modifiers: [.maskCommand, .maskShift])
+        try keySender.send(keyCode: 5, modifiers: [.maskCommand, .maskShift])
         guard let pathField = try await waitForElement(
             withIdentifier: "PathTextField",
             timeout: .seconds(2)
@@ -696,34 +742,69 @@ final class LogicAccessibility {
         ) == .success else {
             throw LogicAutomationError.unexpectedDialog("Go to Folder", captureDiagnosticScreenshot())
         }
-        let navigationFieldHash = CFHash(pathField)
-        keySender.send(keyCode: 36)
+        guard try await waitForStringValue(
+            of: pathField,
+            toEqual: folder.path,
+            timeout: .seconds(2)
+        ) else {
+            throw LogicAutomationError.unexpectedDialog(
+                "Go to Folder did not accept the delivery path",
+                captureDiagnosticScreenshot()
+            )
+        }
+        _ = AXUIElementSetAttributeValue(
+            pathField,
+            kAXFocusedAttribute as CFString,
+            kCFBooleanTrue
+        )
+        try keySender.send(keyCode: 36)
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(2))
+        let deadline = clock.now.advanced(by: .seconds(5))
         while clock.now < deadline {
             try Task.checkCancellation()
-            let stillPresent = currentWindowsAndSheets()
-                .flatMap { descendants(of: $0, maxDepth: 10, limit: 3_000) }
-                .contains { CFHash($0) == navigationFieldHash }
+            let stillPresent = element(
+                withIdentifier: "PathTextField",
+                in: currentWindowsAndSheets()
+            ) != nil
             if !stillPresent { return }
             try await Task.sleep(for: .milliseconds(100))
         }
         throw LogicAutomationError.unexpectedDialog("Go to Folder did not close", captureDiagnosticScreenshot())
     }
 
-    private func pressDefaultButton(in window: AXUIElement) throws {
+    private func waitForStringValue(
+        of element: AXUIElement,
+        toEqual expected: String,
+        timeout: Duration
+    ) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            try Task.checkCancellation()
+            if stringValue(element, kAXValueAttribute) == expected { return true }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        return false
+    }
+
+    private func submitDefaultButton(in window: AXUIElement, keySender: KeySender) throws {
         let buttons = descendants(of: window, maxDepth: 8, limit: 2_000).filter {
             stringValue($0, kAXRoleAttribute) == (kAXButtonRole as String)
         }
-        let preferred = copyElement(window, kAXDefaultButtonAttribute)
-            ?? buttons.first { button in
-                let label = searchableText(button)
-                return ["bounce", "save", "ok"].contains(where: label.contains)
-            }
-        guard let button = preferred,
-              AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
+        guard buttons.contains(where: isConfirmationButton) else {
             throw LogicAutomationError.confirmationButtonMissing
         }
+        try keySender.send(keyCode: 36)
+    }
+
+    private func isConfirmationButton(_ element: AXUIElement) -> Bool {
+        [kAXTitleAttribute, kAXDescriptionAttribute]
+            .compactMap { stringValue(element, $0) }
+            .contains(where: Self.isConfirmationButtonLabel)
+    }
+
+    nonisolated static func isConfirmationButtonLabel(_ label: String) -> Bool {
+        ["bounce", "save", "ok"].contains(label.matchKey)
     }
 
     private func trackName(from element: AXUIElement) -> String? {
@@ -794,21 +875,46 @@ final class LogicAccessibility {
     private func isTrackSelected(_ element: AXUIElement) -> Bool {
         if boolValue(element, kAXSelectedAttribute) == true { return true }
         return copyArray(element, kAXChildrenAttribute).contains { child in
-            stringValue(child, kAXRoleAttribute) == (kAXRadioButtonRole as String)
-                && stringValue(child, kAXDescriptionAttribute)?.matchKey == "has focus"
+            isTrackFocusIndicator(child)
                 && boolValue(child, kAXValueAttribute) == true
         }
     }
 
+    private func isTrackFocusIndicator(_ element: AXUIElement) -> Bool {
+        Self.isTrackFocusIndicator(
+            role: stringValue(element, kAXRoleAttribute),
+            description: stringValue(element, kAXDescriptionAttribute)
+        )
+    }
+
+    nonisolated static func isTrackFocusIndicator(role: String?, description: String?) -> Bool {
+        role == (kAXRadioButtonRole as String) && description?.matchKey == "has focus"
+    }
+
     private func isOnlySelectedTrack(_ element: AXUIElement, in parent: AXUIElement) -> Bool {
-        let selectedChildren = copyArray(parent, kAXSelectedChildrenAttribute)
-        if !selectedChildren.isEmpty {
-            return selectedChildren.count == 1 && CFHash(selectedChildren[0]) == CFHash(element)
+        var selectedHeaderHashes = Set<CFHashCode>()
+        for selectedChild in copyArray(parent, kAXSelectedChildrenAttribute) where isTrackHeader(selectedChild) {
+            selectedHeaderHashes.insert(CFHash(selectedChild))
         }
-        let selectedHeaders = copyArray(parent, kAXChildrenAttribute)
-            .filter(isTrackHeader)
-            .filter(isTrackSelected)
-        return selectedHeaders.count == 1 && CFHash(selectedHeaders[0]) == CFHash(element)
+        for header in copyArray(parent, kAXChildrenAttribute) where isTrackHeader(header) && isTrackSelected(header) {
+            selectedHeaderHashes.insert(CFHash(header))
+        }
+        return selectedHeaderHashes == Set([CFHash(element)])
+    }
+
+    private func waitForExclusiveTrackSelection(
+        _ element: AXUIElement,
+        in parent: AXUIElement,
+        timeout: Duration
+    ) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            try Task.checkCancellation()
+            if isOnlySelectedTrack(element, in: parent) { return true }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        return false
     }
 
     nonisolated static func isTrackHeaderRole(_ role: String) -> Bool {
@@ -899,7 +1005,11 @@ final class LogicAccessibility {
     }
 
     private func windowTitle(_ window: AXUIElement) -> String {
-        stringValue(window, kAXTitleAttribute) ?? "Untitled dialog"
+        if let title = stringValue(window, kAXTitleAttribute), !title.isEmpty { return title }
+        return windowLabels(window)
+            .filter { !$0.isEmpty && $0.count <= 240 }
+            .max(by: { $0.count < $1.count })
+            ?? "Untitled dialog"
     }
 
     private func searchableText(_ element: AXUIElement) -> String {
@@ -916,10 +1026,13 @@ final class LogicAccessibility {
             .matchKey
     }
 
-    private func writeAccessibilityDiagnostic(for windows: [AXUIElement]) -> URL? {
+    private func writeAccessibilityDiagnostic(
+        for windows: [AXUIElement],
+        filename: String = "latest-logic-ax.txt"
+    ) -> URL? {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: "StemBouncer/Diagnostics", directoryHint: .isDirectory)
-        let url = directory.appending(path: "latest-logic-ax.txt")
+        let url = directory.appending(path: filename)
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             var lines = [
